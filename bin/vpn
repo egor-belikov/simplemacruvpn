@@ -7,9 +7,17 @@ SOCKS_PORT="${VPN_SOCKS_PORT:-1080}"
 HTTP_HOST="127.0.0.1"
 HTTP_PORT="1087"
 BREW="${HOMEBREW_PREFIX:-/usr/local}/bin/brew"
-MIHOMO_DIR="${MIHOMO_DIR:-/usr/local/etc/mihomo}"
+MIHOMO_DIR="${MIHOMO_DIR:-}"
+if [[ -z "${MIHOMO_DIR}" ]]; then
+  if [[ -d "/opt/homebrew/etc/mihomo" ]]; then
+    MIHOMO_DIR="/opt/homebrew/etc/mihomo"
+  else
+    MIHOMO_DIR="/usr/local/etc/mihomo"
+  fi
+fi
 MIHOMO_BIN="$(command -v mihomo 2>/dev/null || true)"
 [[ -x "$MIHOMO_BIN" ]] || MIHOMO_BIN="/usr/local/opt/mihomo/bin/mihomo"
+[[ -x "$MIHOMO_BIN" ]] || MIHOMO_BIN="/opt/homebrew/opt/mihomo/bin/mihomo"
 MIHOMO_API="${MIHOMO_API:-http://127.0.0.1:9090}"
 # Системный Python — без поломанного hashlib из pyenv
 VPN_PY="${VPN_PY:-/usr/bin/python3}"
@@ -20,7 +28,8 @@ OPENCC_JSON_URL="${OPENCC_JSON_URL:-https://iplist.opencck.org/?format=json}"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/vpn"
 ENABLED_AT_FILE="$STATE_DIR/enabled_at"
 VPN_SUBSCRIPTIONS_FILE="${VPN_SUBSCRIPTIONS_FILE:-$STATE_DIR/subscriptions.txt}"
-_SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+# Реальный путь к файлу (после symlinks через Homebrew всё попадает в .../simplemacruvpn/vpn_dist/bin/vpn)
+_SCRIPT_PATH="$(perl -MCwd -e 'print(Cwd::abs_path(shift)||"")' "${BASH_SOURCE[0]:-$0}")"
 _SCRIPT_DIR="$(cd "$(dirname "$_SCRIPT_PATH")" && pwd)"
 _VPN_REPO_LIB="${_SCRIPT_DIR}/../lib/vpn_subs_cmd.py"
 if [[ "$(basename "$_SCRIPT_DIR")" == "bin" && -f "$_VPN_REPO_LIB" ]]; then

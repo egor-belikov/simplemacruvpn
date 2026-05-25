@@ -30,9 +30,20 @@ sudo ln -sf "$PWD/bin/vpn" /usr/local/bin/vpn   # или другой катал
 vpn help
 ```
 
+## Homebrew
+
+```bash
+brew tap egor-belikov/simplemacruvpn https://github.com/egor-belikov/simplemacruvpn
+brew install simplemacruvpn
+```
+
+Формула в этом же репозитории (`Formula/simplemacruvpn.rb`). Для установки нужен Git-тег вида **`v1.3.8`**, совпадающий с версией из формулы (`version "1.3.8"`).
+
+Подробнее: `vpn help` после установки.
+
 ## Что понадобится на машине
 
-- [mihomo](https://formulae.brew.sh/formula/mihomo) (`brew install mihomo`), конфиг в `MIHOMO_DIR` (по умолчанию `/usr/local/etc/mihomo`).
+- [mihomo](https://formulae.brew.sh/formula/mihomo) (`brew install mihomo`), конфиг в `MIHOMO_DIR`. Если переменная не задана, берётся `/opt/homebrew/etc/mihomo`, когда он существует, иначе `/usr/local/etc/mihomo` (см. `bin/vpn`).
 - `/usr/bin/python3` или задайте `VPN_PY`.
 
 ## Репозиторий
