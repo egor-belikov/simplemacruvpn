@@ -3,12 +3,13 @@
 class Simplemacruvpn < Formula
   desc "CLI helper for Mihomo SOCKS on macOS (bash + Python: vpn help)"
   homepage "https://github.com/egor-belikov/simplemacruvpn"
-  license "MIT"
 
   url "https://github.com/egor-belikov/simplemacruvpn.git",
       tag:      "v1.3.8",
       revision: "28376e928ac7ebb5d35b6fe3322781dbcb884f68",
       using:    :git
+
+  license "MIT"
 
   head "https://github.com/egor-belikov/simplemacruvpn.git",
        branch: "main"
