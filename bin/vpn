@@ -1,0 +1,784 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVICE="${VPN_SERVICE:-Wi-Fi}"
+SOCKS_HOST="127.0.0.1"
+SOCKS_PORT="${VPN_SOCKS_PORT:-1080}"
+HTTP_HOST="127.0.0.1"
+HTTP_PORT="1087"
+BREW="${HOMEBREW_PREFIX:-/usr/local}/bin/brew"
+MIHOMO_DIR="${MIHOMO_DIR:-/usr/local/etc/mihomo}"
+MIHOMO_BIN="$(command -v mihomo 2>/dev/null || true)"
+[[ -x "$MIHOMO_BIN" ]] || MIHOMO_BIN="/usr/local/opt/mihomo/bin/mihomo"
+MIHOMO_API="${MIHOMO_API:-http://127.0.0.1:9090}"
+# Системный Python — без поломанного hashlib из pyenv
+VPN_PY="${VPN_PY:-/usr/bin/python3}"
+
+# OpenCC allowlist (JSON): см. `vpn update-opencck`
+OPENCC_JSON_URL="${OPENCC_JSON_URL:-https://iplist.opencck.org/?format=json}"
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/vpn"
+ENABLED_AT_FILE="$STATE_DIR/enabled_at"
+VPN_SUBSCRIPTIONS_FILE="${VPN_SUBSCRIPTIONS_FILE:-$STATE_DIR/subscriptions.txt}"
+_SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+_SCRIPT_DIR="$(cd "$(dirname "$_SCRIPT_PATH")" && pwd)"
+_VPN_REPO_LIB="${_SCRIPT_DIR}/../lib/vpn_subs_cmd.py"
+if [[ "$(basename "$_SCRIPT_DIR")" == "bin" && -f "$_VPN_REPO_LIB" ]]; then
+  VPN_PROJECT_ROOT="$(cd "${_SCRIPT_DIR}/.." && pwd)"
+  VPN_SUBS_CMD="${VPN_SUBS_CMD:-$VPN_PROJECT_ROOT/lib/vpn_subs_cmd.py}"
+else
+  VPN_SUBS_CMD="${VPN_SUBS_CMD:-${HOME}/.local/lib/vpn_subs_cmd.py}"
+fi
+
+# Узел и правила: $MIHOMO_DIR/config.yaml
+#
+# «vpn on» не форкнит второй mihomo: «brew services start» вызывается только
+# если на $SOCKS_PORT нет LISTEN — иначе лишь снова прописывает системный SOCKS.
+
+socks_enabled() {
+  networksetup -getsocksfirewallproxy "$SERVICE" 2>/dev/null | grep -qi '^Enabled: Yes'
+}
+
+socks_listening() {
+  lsof -iTCP:"$SOCKS_PORT" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+socks_listener_pids() {
+  # уникальные PID процессов с TCP LISTEN на $SOCKS_PORT
+  lsof -nP -iTCP:"$SOCKS_PORT" -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $2}' | sort -u
+}
+
+audit_socks_listener() {
+  # После успешного ожидания порта: предупредить о множественных PID или чужом процессе на :1080
+  local pids pid n cmd
+  pids=$(socks_listener_pids || true)
+  n=0
+  if [[ -n "$pids" ]]; then
+    n=$(grep -c . <<<"$pids" || echo 0)
+  fi
+  ((n == 0)) && return 0
+  if ((n > 1)); then
+    echo "[on] ВНИМАНИЕ: на :${SOCKS_PORT} с LISTEN связано больше одного PID — странно для одного порта:" >&2
+    sed 's/^/[on]   /' <<<"$pids" >&2
+  fi
+  pid=$(head -1 <<<"$pids")
+  cmd=$(ps -p "$pid" -o command= 2>/dev/null | head -c 120 || true)
+  if [[ -n "$cmd" && "$cmd" != *mihomo* ]]; then
+    echo "[on] ВНИМАНИЕ: на :${SOCKS_PORT} слушает PID $pid, это не mihomo — прокси укажет не туда." >&2
+    echo "[on]   $cmd" >&2
+  fi
+}
+
+wait_socks_listening() {
+  local i
+  for i in {1..20}; do
+    socks_listening && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+human_duration() {
+  local sec="$1" d h m s out
+  if [[ -z "$sec" ]] || [[ ! "$sec" =~ ^[0-9]+$ ]] || (( sec < 0 )); then
+    printf '%s' "—"
+    return
+  fi
+  d=$((sec / 86400))
+  h=$(((sec % 86400) / 3600))
+  m=$(((sec % 3600) / 60))
+  s=$((sec % 60))
+  out=""
+  ((d > 0)) && out+="${d}д "
+  ((h > 0 || d > 0)) && out+="${h}ч "
+  ((m > 0 || h > 0 || d > 0)) && out+="${m}м "
+  out+="${s}с"
+  printf '%s' "$out"
+}
+
+record_enabled_if_needed() {
+  mkdir -p "$STATE_DIR"
+  [[ -f "$ENABLED_AT_FILE" ]] && return 0
+  date +%s >"$ENABLED_AT_FILE"
+}
+
+clear_enabled_record() {
+  rm -f "$ENABLED_AT_FILE" 2>/dev/null || true
+}
+
+apply_system_socks() {
+  networksetup -setsocksfirewallproxy "$SERVICE" "$SOCKS_HOST" "$SOCKS_PORT"
+  networksetup -setsocksfirewallproxystate "$SERVICE" on
+  networksetup -setwebproxystate "$SERVICE" on
+  networksetup -setwebproxystate "$SERVICE" off
+  networksetup -setsecurewebproxystate "$SERVICE" off
+  scutil --proxy >/dev/null 2>&1 || true
+}
+
+mihomo_pid() {
+  # Один главный процесс сервиса (не дочерние без -d или с другим конфигом)
+  pgrep -f "mihomo .* -d .*${MIHOMO_DIR}" 2>/dev/null | head -1 ||
+    pgrep -f "/opt/mihomo/bin/mihomo" 2>/dev/null | head -1 ||
+    pgrep -f "mihomo" 2>/dev/null | head -1 ||
+    true
+}
+
+mihomo_brew_row() {
+  [[ -x "$BREW" ]] && "$BREW" services info mihomo 2>/dev/null | head -5 || true
+}
+
+geo_via_proxy() {
+  # Несколько сервисов: при блоке/лагах ipinfo.io «vpn info» не должен быть пустым.
+  local json cc city ip probe
+  if ! socks_listening; then
+    echo "нет_слушателя"
+    return 1
+  fi
+  for probe in \
+    "https://ipinfo.io/json" \
+    "https://ifconfig.co/json" \
+    "https://api.ip.sb/geoip"
+  do
+    json=""
+    json="$(curl -fsS --connect-timeout 6 --max-time 20 \
+      --proxy "socks5h://${SOCKS_HOST}:${SOCKS_PORT}" \
+      "$probe" 2>/dev/null)" || continue
+    cc=""
+    cc="$(perl -0777 -ne 'print $1 if /"country"\s*:\s*"([^"]*)"/' <<<"$json" 2>/dev/null)" || true
+    [[ -z "$cc" ]] && cc="$(perl -0777 -ne 'print $1 if /"country_iso"\s*:\s*"([^"]*)"/' <<<"$json" 2>/dev/null)" || true
+    [[ -z "$cc" ]] && cc="$(perl -0777 -ne 'print $1 if /"country_code"\s*:\s*"([^"]*)"/' <<<"$json" 2>/dev/null)" || true
+    city="$(perl -0777 -ne 'print $1 if /"city"\s*:\s*"([^"]*)"/' <<<"$json" 2>/dev/null)" || city=""
+    [[ -z "$city" ]] && city="$(perl -0777 -ne 'print $1 if /"region"\s*:\s*"([^"]*)"/' <<<"$json" 2>/dev/null)" || true
+    ip="$(perl -0777 -ne 'print $1 if /"ip"\s*:\s*"([^"]*)"/' <<<"$json" 2>/dev/null)" || ip=""
+    [[ -z "$ip" ]] && ip="$(perl -0777 -ne 'print $1 if /"query"\s*:\s*"([^"]*)"/' <<<"$json" 2>/dev/null)" || true
+    if [[ -n "$cc" ]]; then
+      printf '%s' "${cc}|${city:-—}|${ip:-—}"
+      return 0
+    fi
+  done
+  echo "запрос_не_удался"
+  return 1
+}
+
+mihomo_fast_auto_now() {
+  local j n
+  j="$(curl -fsS --max-time 5 "$MIHOMO_API/proxies/FAST-AUTO" 2>/dev/null)" || return 1
+  n="$(perl -0777 -ne 'print $1 if /"now"\s*:\s*"([^"]*)"/' <<<"$j" 2>/dev/null)" || n=""
+  [[ -n "$n" ]] || return 1
+  printf '%s' "$n"
+}
+
+ensure_mihomo_config() {
+  [[ -f "$MIHOMO_DIR/config.yaml" ]] || {
+    echo "Ошибка: нет конфига $MIHOMO_DIR/config.yaml" >&2
+    exit 1
+  }
+}
+
+stop_xray_free_port() {
+  if [[ -x "$BREW" ]]; then
+    "$BREW" services stop xray >/dev/null 2>&1 || true
+  fi
+}
+
+cmd_update_lists() {
+  mkdir -p "$MIHOMO_DIR" 2>/dev/null || true
+  local base="https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download"
+  curl -fL "$base/geosite.dat" -o "$MIHOMO_DIR/geosite.dat.new"
+  mv -f "$MIHOMO_DIR/geosite.dat.new" "$MIHOMO_DIR/geosite.dat"
+  curl -fL "$base/geoip.dat" -o "$MIHOMO_DIR/geoip.dat.new"
+  mv -f "$MIHOMO_DIR/geoip.dat.new" "$MIHOMO_DIR/geoip.dat"
+  echo "Обновлены geosite.dat и geoip.dat → $MIHOMO_DIR"
+  cmd_reload
+}
+
+cmd_update_opencck() {
+  mkdir -p "$MIHOMO_DIR/providers" "$MIHOMO_DIR/scripts" 2>/dev/null || true
+  ensure_mihomo_config
+  local tmp gen
+  gen="$MIHOMO_DIR/scripts/gen_opencck.py"
+  [[ -f "$gen" ]] || {
+    echo "Ошибка: нет генератора $gen" >&2
+    exit 1
+  }
+  tmp="$(mktemp /tmp/opencck.XXXXXX.json)"
+  cleanup() { rm -f "$tmp" 2>/dev/null || true; }
+  trap cleanup EXIT
+  echo "[opencck] curl $OPENCC_JSON_URL …"
+  curl -fsSL --connect-timeout 15 --max-time 120 "$OPENCC_JSON_URL" -o "$tmp" || {
+    echo "Ошибка: не удалось скачать OpenCC JSON" >&2
+    exit 1
+  }
+  "$VPN_PY" "$gen" "$tmp" "$MIHOMO_DIR/providers/opencck.yaml" || {
+    echo "Ошибка: gen_opencck.py" >&2
+    exit 1
+  }
+  cleanup
+  trap - EXIT
+  cmd_reload
+}
+
+cmd_reload() {
+  [[ -x "$MIHOMO_BIN" ]] || {
+    echo "Ошибка: не найден mihomo ($MIHOMO_BIN)" >&2
+    exit 1
+  }
+  "$MIHOMO_BIN" -t -d "$MIHOMO_DIR" >/dev/null 2>&1 || {
+    echo "Ошибка: mihomo -t для $MIHOMO_DIR/config.yaml" >&2
+    exit 1
+  }
+  if [[ -x "$BREW" ]]; then
+    "$BREW" services restart mihomo >/dev/null 2>&1 || "$BREW" services start mihomo >/dev/null 2>&1 || true
+  fi
+  echo "[reload] Mihomo перезапущен, конфиг: $MIHOMO_DIR/config.yaml"
+}
+
+cmd_autostart_diag() {
+  local plist="$HOME/Library/LaunchAgents/com.egor.vpn-autostart.plist"
+  echo "=== автозапуск ==="
+  if [[ ! -f "$plist" ]]; then
+    echo "LaunchAgent plist не найден: $plist"
+    return 1
+  fi
+  echo " plist: OK ($plist)"
+  if plutil -lint "$plist" >/dev/null 2>&1; then
+    echo " синтаксис plist: OK (plutil -lint)"
+  else
+    echo " синтаксис plist: ОШИБКА → plutil -lint $plist"
+  fi
+  if launchctl list 2>/dev/null | grep -q 'com.egor.vpn-autostart'; then
+    echo " launchctl list: есть com.egor.vpn-autostart (загружён один раз после входа, затем задача может завершиться — это норма)"
+  else
+    echo "ВНИМАНИЕ: метка не в launchctl — загрузите: launchctl bootstrap gui/$(id -u) \"$plist\""
+  fi
+  echo " Mihomo через Homebrew:"
+  if [[ -x "$BREW" ]]; then
+    "$BREW" services info mihomo 2>/dev/null | grep -E '^(mihomo|Running|Loaded|Schedulable|User|PID)' || true
+  fi
+  echo " После изменения plist: bootstrap → см. сообщение vpn autostart-fix"
+}
+
+cmd_autostart_fix() {
+  local plist="$HOME/Library/LaunchAgents/com.egor.vpn-autostart.plist"
+  launchctl bootout gui/"$(id -u)" "$plist" >/dev/null 2>&1 || true
+  launchctl bootstrap gui/"$(id -u)" "$plist"
+  echo "[autostart-fix] plist перезагружен в launchd gui/$(id -u)"
+}
+
+cmd_on() {
+  stop_xray_free_port
+  ensure_mihomo_config
+  [[ -x "$MIHOMO_BIN" ]] || {
+    echo "Ошибка: mihomo не найден (brew install mihomo)" >&2
+    exit 1
+  }
+  "$MIHOMO_BIN" -t -d "$MIHOMO_DIR" >/dev/null 2>&1 || {
+    echo "Ошибка: mihomo -t не проходит для $MIHOMO_DIR/config.yaml" >&2
+    exit 1
+  }
+
+  if ! socks_listening; then
+    if [[ -x "$BREW" ]]; then
+      "$BREW" services start mihomo >/dev/null 2>&1 || true
+    fi
+    sleep 1
+  else
+    echo "[on] Порт ${SOCKS_PORT} уже в LISTEN — «brew services start mihomo» не вызываю (второй экземпляр не стартую)."
+  fi
+  if ! wait_socks_listening; then
+    echo "Ошибка: никто не слушает ${SOCKS_HOST}:${SOCKS_PORT} — системный прокси не включаю." >&2
+    echo "  Проверь: brew services list mihomo" >&2
+    echo "  Тест конфига: $MIHOMO_BIN -t -d $MIHOMO_DIR" >&2
+    echo "  Если сеть «пропала»: vpn fix" >&2
+    exit 1
+  fi
+
+  audit_socks_listener
+
+  apply_system_socks
+
+  record_enabled_if_needed
+
+  echo "[on] SOCKS для «${SERVICE}» → ${SOCKS_HOST}:${SOCKS_PORT} · mihomo · HTTP-системный прокси выкл"
+  mpid=""
+  mpid="$(mihomo_pid || true)"
+  [[ -n "$mpid" ]] && echo "[on] mihomo PID: $mpid · слушает $SOCKS_PORT: да"
+
+  geo="$(geo_via_proxy 2>/dev/null || echo …)"
+  IFS='|' read -r _g_cc _g_city _g_ip <<<"${geo}|"
+  if [[ -n "${_g_cc:-}" && "$_g_cc" != … && "$_g_cc" != нет_* && "$_g_cc" != запрос_* ]]; then
+    echo "[on] Выход через прокси выглядит как ${_g_cc}${_g_city:+ · ${_g_city}}${_g_ip:+ · ${_g_ip}}"
+  else
+    echo "[on] Проверка выходной страны недоступна (см.: vpn info)"
+  fi
+
+  ts="$(cat "$ENABLED_AT_FILE" 2>/dev/null || echo "")"
+  if [[ -n "$ts" ]] && ts=$(printf '%s' "$ts" | tr -dc '0-9'); then
+    now=$(date +%s)
+    echo "[on] Сессия SOCKS с момента первого вкл. в этом цикле: $(human_duration $((now - ts))) · отметка: $ENABLED_AT_FILE"
+  fi
+
+  echo "[on] После входа в систему: ~/Library/LaunchAgents/com.egor.vpn-autostart.plist — проверка: vpn autostart-diag"
+}
+
+cmd_fix() {
+  networksetup -setsocksfirewallproxystate "$SERVICE" off 2>/dev/null || true
+  networksetup -setwebproxystate "$SERVICE" off 2>/dev/null || true
+  echo "[fix] Прокси на «${SERVICE}» выключены (прямой доступ в браузере)."
+  echo " Затем: brew services start mihomo && vpn on"
+}
+
+cmd_off() {
+  networksetup -setsocksfirewallproxystate "$SERVICE" off 2>/dev/null || true
+  networksetup -setwebproxystate "$SERVICE" off 2>/dev/null || true
+  clear_enabled_record
+  if [[ -x "$BREW" ]]; then
+    "$BREW" services stop mihomo >/dev/null 2>&1 || true
+    "$BREW" services stop xray >/dev/null 2>&1 || true
+  fi
+  echo "[off] Прокси «${SERVICE}» выкл · mihomo и xray (если есть) остановлены через brew"
+}
+
+cmd_restart() {
+  local want
+  want=false
+  socks_enabled && want=true
+  [[ "$want" == false ]] && [[ -f "$ENABLED_AT_FILE" ]] && want=true
+
+  stop_xray_free_port
+  ensure_mihomo_config
+
+  echo "[restart] Перезапуск mihomo (brew services restart)…"
+  if [[ -x "$BREW" ]]; then
+    "$BREW" services restart mihomo >/dev/null 2>&1 || "$BREW" services start mihomo >/dev/null 2>&1 || true
+  fi
+  sleep 1
+  if ! wait_socks_listening; then
+    echo "[restart] Ошибка: после перезапуска не слушается ${SOCKS_HOST}:${SOCKS_PORT}" >&2
+    exit 1
+  fi
+  if [[ "$want" == true ]]; then
+    apply_system_socks
+    record_enabled_if_needed
+    echo "[restart] SOCKS снова применены для «${SERVICE}»"
+  else
+    echo "[restart] Системный прокси не трогаем — до перезапуска SOCKS были выкл."
+  fi
+  mpid="$(mihomo_pid || true)"
+  [[ -n "$mpid" ]] && echo "[restart] mihomo PID: $mpid"
+}
+
+cmd_status() {
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo " статус vpn / mihomo"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  local se sl
+  se="выкл"
+  socks_enabled && se="ВКЛ"
+  sl="нет"
+  socks_listening && sl="да"
+  echo " Системный SOCKS ($SERVICE): $se · ${SOCKS_HOST}:${SOCKS_PORT} · слушатель: $sl"
+  networksetup -getsocksfirewallproxy "$SERVICE" 2>/dev/null | sed 's/^/   /'
+
+  echo "--- mihomo (brew)"
+  [[ -x "$BREW" ]] && "$BREW" services list 2>/dev/null | grep -E '^mihomo\s' | sed 's/^/ /' || true
+  mpid=""
+  mpid="$(mihomo_pid || true)"
+  if [[ -n "$mpid" ]]; then
+    echo " процесс PID $mpid: $(ps -p "$mpid" -o etime= 2>/dev/null | sed 's/^[[:space:]]*//') (elapsed)"
+    ps -p "$mpid" -o command= 2>/dev/null | sed 's/^/ /'
+  else
+    echo " процесс не найден (pgrep)"
+  fi
+
+  echo "--- подсказки"
+  echo " vpn info  — страна через прокси, аптайм, длительность сессии"
+  echo " vpn help  — все команды"
+  echo " vpn bench · vpn proxy … · vpn countries · vpn subs preview · vpn hw"
+  echo " vpn autostart-diag · vpn autostart-fix"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  if socks_enabled && ! socks_listening; then
+    echo "" >&2
+    echo "ВНИМАНИЕ: SOCKS в системе ВКЛ, но на $SOCKS_PORT никто не слушает → «нет интернета»." >&2
+    echo " Срочно: vpn fix  или запустите: brew services start mihomo" >&2
+  fi
+}
+
+cmd_info() {
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo " vpn info"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  local se sl now ts secs mpid elapsed brewinfo geo cc city ip
+  se="нет"
+  socks_enabled && se="да"
+  sl="нет"
+  socks_listening && sl="да"
+  echo " Системный SOCKS ($SERVICE): включён=${se}"
+  echo " Локальный слушатель $SOCKS_PORT: $sl"
+
+  now=$(date +%s)
+  if [[ -f "$ENABLED_AT_FILE" ]]; then
+    ts=$(tr -dc '0-9' <"$ENABLED_AT_FILE")
+    secs=$((now - ts))
+    echo " Время от первого «vpn on» в текущей сессии: $(human_duration "$secs") (файл: $ENABLED_AT_FILE)"
+    echo " Метка времени: $(date -r "$ts" '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null || echo "$ts epoch")"
+  else
+    echo " Файла сессии нет (${ENABLED_AT_FILE}) — либо ещё не делали успешный «vpn on», либо был «vpn off»."
+    if socks_enabled && [[ "$sl" == да ]]; then
+      echo " (SOCKS уже включены вручную — длительность «сессии» по файлу недоступна.)"
+    fi
+  fi
+
+  mpid="$(mihomo_pid || true)"
+  if [[ -n "$mpid" ]]; then
+    elapsed="$(ps -p "$mpid" -o etime= 2>/dev/null | sed 's/^[[:space:]]*//')"
+    echo " mihomo: PID=${mpid} · аптайм процесса (ps etime)=${elapsed:-?}"
+    brewinfo=""
+    brewinfo="$(mihomo_brew_row 2>/dev/null | sed -n '/^Running:/p')" || true
+    [[ -n "$brewinfo" ]] && echo "         $brewinfo"
+  else
+    echo " mihomo: процесс не найден"
+    [[ -x "$BREW" ]] && mihomo_brew_row | sed 's/^/ /'
+  fi
+
+  fa_now=""
+  fa_now="$(mihomo_fast_auto_now 2>/dev/null)" || true
+  echo "--- mihomo (активный узел url-test FAST-AUTO → Cursor)"
+  if [[ -n "$fa_now" ]]; then
+    echo " Сейчас выбран: $fa_now  (fallback по пингу US / KZ / GB)"
+  else
+    echo " API $MIHOMO_API недоступен или mihomo ещё не поднялся — см. vpn status"
+  fi
+
+  echo "--- локация исходящего IP (через socks5h://$SOCKS_HOST:$SOCKS_PORT)"
+  geo="$(geo_via_proxy 2>/dev/null)" || geo=""
+  case "$geo" in
+    нет_слушателя)
+      echo " Не смог проверить: нет слушателя на порту ${SOCKS_PORT}."
+      ;;
+    запрос_не_удался|"")
+      echo " Не смог достучаться до проверочных сервисов через прокси (таймаут / блок / мёртвые узлы)."
+      [[ -n "$fa_now" ]] && echo " Узел в конфигурации указан выше — отдельный гео-запрос не прошёл."
+      ;;
+    *)
+      IFS='|' read -r cc city ip <<<"$geo"
+      echo " Код страны (проверочный сервис): ${cc:-?}"
+      echo " Город/регион (если есть): ${city:-—}"
+      echo " IP как снаружи: ${ip:-—}"
+      ;;
+  esac
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+cmd_bench() {
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo " vpn bench — задержка до api2.cursor.sh (мс, меньше лучше)"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  if ! socks_listening; then
+    echo " Нет слушателя на ${SOCKS_HOST}:${SOCKS_PORT} — сначала: vpn on" >&2
+    return 1
+  fi
+  "$VPN_PY" <<'PY'
+import json, urllib.parse, urllib.request
+base = "http://127.0.0.1:9090"
+test_url = "https://api2.cursor.sh"
+
+def delay(name: str):
+    q = urllib.parse.quote(name, safe="")
+    u = f"{base}/proxies/{q}/delay?timeout=18000&url={urllib.parse.quote(test_url, safe='')}"
+    try:
+        with urllib.request.urlopen(u, timeout=22) as r:
+            return json.load(r).get("delay", r.read()[:80])
+    except Exception as e:
+        return f"err:{e}"
+
+try:
+    meta = json.load(urllib.request.urlopen(f"{base}/proxies/PROXY", timeout=3))
+except Exception as e:
+    print(f" Mihomo API недоступен ({base}): {e}")
+    print(" Дождитесь полного старта mihomo (~10–15 с после restart).")
+    raise SystemExit(1)
+
+nodes = [x for x in meta["all"] if x != "FAST-AUTO"]
+for n in nodes:
+    print(f"  {n[:72]:72}  {delay(n)}")
+try:
+    fa = json.load(urllib.request.urlopen(f"{base}/proxies/FAST-AUTO", timeout=3))
+    print(f"--- FAST-AUTO сейчас: {fa.get('now')}")
+except Exception:
+    pass
+PY
+  echo "--- curl через текущий PROXY (socks5h) ---"
+  curl -sS -o /dev/null -w "  time_total=%{time_total}s http=%{http_code}\n" \
+    --proxy "socks5h://${SOCKS_HOST}:${SOCKS_PORT}" --max-time 28 "https://api2.cursor.sh/" || echo "  curl: ошибка"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+cmd_proxy() {
+  # Все узлы и переключение — через REST mihomo; аргументы см. ниже и «vpn proxy list».
+  MIHOMO_API="$MIHOMO_API" SOCKS_HOST="$SOCKS_HOST" SOCKS_PORT="$SOCKS_PORT" \
+    "$VPN_PY" - "${1:-}" <<'PY'
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+BASE = os.environ.get("MIHOMO_API", "http://127.0.0.1:9090").rstrip("/")
+ARG = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
+
+# Алиасы стран: флаг в имени узла 🇺🇸/🇬🇧/🇰🇿 + ключевые слова
+_FLAG_US = "\U0001f1fa\U0001f1f8"
+_FLAG_GB = "\U0001f1ec\U0001f1e7"
+_FLAG_KZ = "\U0001f1f0\U0001f1ff"
+
+SYN = {
+    "usa": (_FLAG_US, "usa", "united states", "america", "\u0441\u0448\u0430"),
+    "us": (_FLAG_US, "usa", "united states", "america", "\u0441\u0448\u0430"),
+    "сша": (_FLAG_US, "usa", "\u0441\u0448\u0430"),
+    "gb": (_FLAG_GB, "great britain", "united kingdom", "britain", "\u0432\u0435\u043b\u0438\u043a\u043e\u0431\u0440\u0438\u0442"),
+    "uk": (_FLAG_GB, "great britain", "united kingdom", "britain", "\u0432\u0435\u043b\u0438\u043a\u043e\u0431\u0440\u0438\u0442"),
+    "britain": (_FLAG_GB, "britain", "united kingdom", "\u0432\u0435\u043b\u0438\u043a\u043e\u0431\u0440\u0438\u0442"),
+    "kz": (_FLAG_KZ, "kazakh", "kazахстан", "\u043a\u0430\u0437\u0430"),
+    "kazakhstan": (_FLAG_KZ, "kazakh", "kazахстан", "\u043a\u0430\u0437\u0430"),
+    "казахстан": (_FLAG_KZ, "kazakh", "\u043a\u0430\u0437\u0430\u0445", "\u043a\u0430\u0437\u0430"),
+}
+
+USAGE = """usage: vpn proxy               — то же что list + краткая справка
+       vpn proxy list            — узлы с номерами и текущий
+       vpn proxy 0…N             — выбор по номеру из списка
+       vpn proxy us | gb | kz | казахстан | …
+       vpn proxy auto            — FAST-AUTO (авто по пингу до Cursor)
+       vpn proxy sub             — первый узел списка (как legacy sub)"""
+
+
+def proxy_meta():
+    url = f"{BASE}/proxies/PROXY"
+    with urllib.request.urlopen(url, timeout=12) as r:
+        return json.load(r)
+
+
+def proxy_put(name: str):
+    body = json.dumps({"name": name}).encode()
+    req = urllib.request.Request(
+        f"{BASE}/proxies/PROXY",
+        data=body,
+        method="PUT",
+        headers={"Content-Type": "application/json"},
+    )
+    urllib.request.urlopen(req, timeout=12)
+
+
+def list_and_help(meta, *, footer: bool) -> None:
+    alln = meta["all"]
+    now = meta.get("now")
+    print("\u2501" * 40)
+    print(" vpn proxy — узлы (группа PROXY)")
+    print("  выбор:  vpn proxy 1   или   vpn proxy kz | us | gb | auto")
+    print("\u2501" * 40)
+    for i, name in enumerate(alln):
+        mark = "   \u2190 сейчас" if name == now else ""
+        print(f"  {i}: {name}{mark}")
+    print("\u2501" * 40)
+    if footer:
+        print(USAGE.replace("vpn proxy ", "  "))
+
+
+def uniq_match(leaves, needles):
+    # type: (list[str], tuple[str, ...]) -> list[str]
+    if not needles:
+        return []
+    out = []
+    for name in leaves:
+        low = name.casefold()
+        if any(low.find(n.casefold()) >= 0 for n in needles if n):
+            out.append(name)
+    return out
+
+
+def main():
+    arg = ARG
+    meta = proxy_meta()
+
+    arg_l_pre = arg.casefold() if arg else ""
+    if not arg or arg_l_pre in ("list", "ls", "l", "help", "h"):
+        list_and_help(meta, footer=not bool(arg))
+        return
+
+    alln = meta["all"]
+
+    arg_l = arg.casefold()
+
+    if arg.isdigit():
+        i = int(arg)
+        if i < 0 or i >= len(alln):
+            print(f"\u041e\u0448\u0438\u0431\u043a\u0430: \u043d\u0435\u0442 \u0443\u0437\u043b\u0430 \u0441 \u043d\u043e\u043c\u0435\u0440\u043e\u043c {i} (\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u043e 0\u2026{len(alln)-1})", file=sys.stderr)
+            sys.exit(1)
+        proxy_put(alln[i])
+        print("[proxy] PROXY \u2192", alln[i])
+        return
+
+    if arg_l in ("auto", "fast", "fin5", "fi"):
+        proxy_put("FAST-AUTO")
+        print("[proxy] PROXY \u2192 FAST-AUTO (\u0430\u0432\u0442\u043e \u043f\u043e \u043f\u0438\u043d\u0433\u0443 \u0434\u043e api2.cursor.sh)")
+        return
+
+    if arg_l == "sub":
+        leaves = [x for x in alln if x != "FAST-AUTO"]
+        if not leaves:
+            print("\u041e\u0448\u0438\u0431\u043a\u0430: \u043d\u0435\u0442 \u043e\u0442\u0434\u0435\u043b\u044c\u043d\u044b\u0445 \u0443\u0437\u043b\u043e\u0432", file=sys.stderr)
+            sys.exit(1)
+        name = leaves[0]
+        proxy_put(name)
+        print("[proxy] PROXY \u2192", name, "(sub: \u043f\u0435\u0440\u0432\u044b\u0439 \u0432 \u0441\u043f\u0438\u0441\u043a\u0435)")
+        return
+
+    needles = SYN.get(arg_l)
+    if needles is None:
+        # одно случайное вхождение подстроки (как короткий «ручной» фильтр)
+        needles = (arg,)
+    leaves = [x for x in alln if x != "FAST-AUTO"]
+    cand = uniq_match(leaves, needles)
+
+    if len(cand) == 1:
+        proxy_put(cand[0])
+        print("[proxy] PROXY \u2192", cand[0])
+        return
+
+    if len(cand) > 1:
+        print(
+            f"\u041d\u0435\u043e\u0434\u043d\u043e\u0437\u043d\u0430\u0447\u043d\u043e '{arg}', \u043f\u043e\u0434\u0445\u043e\u0434\u0438\u0442:",
+            file=sys.stderr,
+        )
+        for x in cand:
+            print(" ", x, file=sys.stderr)
+        sys.exit(1)
+
+    print(
+        f'\u041d\u0438\u0447\u0435\u0433\u043e \u043d\u0435 \u043d\u0430\u0448\u0451\u043b \u043f\u043e "{arg}". \u0417\u0430\u043f\u0443\u0441\u0442\u0438: vpn proxy list',
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+try:
+    main()
+except urllib.error.URLError as e:
+    print(f"Mihomo API \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d ({BASE}): {e}", file=sys.stderr)
+    sys.exit(1)
+PY
+
+}
+
+cmd_hw() {
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo " vpn hw — сеть/Wi‑Fi (софт может врать; серьёзную диагностику даёт Apple)"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  if command -v system_profiler >/dev/null 2>&1; then
+    echo "--- AirPort (фрагмент) ---"
+    system_profiler SPAirPortDataType 2>/dev/null | grep -E 'Status|Channel|Transmit Rate|Signal|Noise|Country Code|Supported PHY' | head -18 || true
+  fi
+  echo "--- netstat -i (растут Ierrs/Oerrs при «тишине» — повод сбросить Wi‑Fi/роутер) ---"
+  netstat -i
+  if command -v networkQuality >/dev/null 2>&1; then
+    echo "--- networkQuality (sequential, ~20–40 с) ---"
+    networkQuality -s 2>&1 | head -30 || true
+  fi
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+cmd_help() {
+  cat <<'EOS'
+Команда vpn — обёртка над mihomo (SOCKS для macOS) и подписками.
+
+ СОСТОЯНИЕ
+  vpn on                  включить системный SOCKS на 127.0.0.1:1080, старт mihomo
+  vpn off                 выключить SOCKS, остановить mihomo/xray (brew)
+  vpn toggle | t          переключатель on/off
+  vpn restart             перезапуск mihomo; если SOCKS были вкл — применить снова
+  vpn fix | repair        снять системный прокси (если «нет сети», а mihomo упал)
+  vpn                     без аргументов — то же что status
+
+ СПРАВКА
+  vpn help | -h | --help  эта справка
+
+ ДИАГНОСТИКА / ИНФО
+  vpn status | s          SOCKS, mihomo brew, подсказки
+  vpn info | i            узел FAST-AUTO, гео через прокси, сессия
+  vpn bench | b           пинг узлов до api2.cursor.sh через API mihomo
+  vpn hw                  Wi‑Fi / netstat / networkQuality
+
+ ПРОКСИ‑УЗЕЛ (REST mihomo на 127.0.0.1:9090)
+  vpn proxy               список узлов + номера
+  vpn proxy list          то же
+  vpn proxy 0…N           выбрать узел по номеру
+  vpn proxy us | gb | kz … | auto | sub
+  vpn countries | c | nodes список узлов; дальше как у proxy: vpn countries us
+
+ ПОДПИСКИ (файл см. vpn subs path; не трогает сами proxy-providers в yaml)
+  vpn subs                список сохранённых URL
+  vpn subs init           подтянуть url: из $MIHOMO_DIR/config.yaml
+  vpn subs preview        скачать и разобрать узлы по всем URL из файла
+  vpn subs add 'https://…'
+  vpn subs rm N           удалить строку N (как в vpn subs list)
+
+ КОНФИГ / ДАННЫЕ MIHOMO
+  vpn reload | r          mihomo -t + brew services restart mihomo
+  vpn update-lists | u    обновить geoip.dat и geosite.dat (MetaCubeX)
+  vpn update-opencck      обновить RULE-SET OpenCC (iplist.opencck.org)
+
+ АВТОЗАПУСК (LaunchAgent)
+  vpn autostart-diag | ad
+  vpn autostart-fix | af
+
+ ПЕРЕМЕННЫЕ (необязательно)
+  VPN_SERVICE            интерфейс для networksetup (по умолчанию Wi‑Fi)
+  MIHOMO_DIR             каталог конфига mihomo
+  VPN_SUBSCRIPTIONS_FILE путь к файлу URL подписок
+  VPN_SUBS_CMD           скрипт python для vpn subs
+
+ Примечание: публикация в Homebrew — отдельный шаг позже (нужен свой tap/формула).
+
+EOS
+}
+
+cmd_subs() {
+  mkdir -p "$STATE_DIR"
+  [[ "$#" -eq 0 ]] && set -- list
+  VPN_SUBSCRIPTIONS_FILE="$VPN_SUBSCRIPTIONS_FILE" MIHOMO_DIR="$MIHOMO_DIR" \
+    "$VPN_PY" "$VPN_SUBS_CMD" "$@"
+}
+
+
+case "${1:-}" in
+  help|h|-h|--help) cmd_help ;;
+  on|1|start) cmd_on ;;
+  off|0|stop) cmd_off ;;
+  restart) cmd_restart ;;
+  fix|repair) cmd_fix ;;
+  info|i) cmd_info ;;
+  autostart-diag|ad) cmd_autostart_diag ;;
+  autostart-fix|af) cmd_autostart_fix ;;
+  t|toggle)
+    if socks_enabled; then cmd_off; else cmd_on; fi
+    ;;
+  s|status|'') cmd_status ;;
+  r|reload) cmd_reload ;;
+  u|update-lists) cmd_update_lists ;;
+  opencck|update-opencck) cmd_update_opencck ;;
+  bench|b) cmd_bench ;;
+  countries|c|nodes) shift; cmd_proxy "${1:-list}" ;;
+  proxy|p) shift; cmd_proxy "${1:-}" ;;
+  subs|subscriptions)
+    shift
+    if (($# == 0)); then set -- list; fi
+    cmd_subs "$@"
+    ;;
+  hw) cmd_hw ;;
+  *)
+    echo "Неизвестная команда «${1:-}». Справка: vpn help" >&2
+    exit 1
+    ;;
+esac
