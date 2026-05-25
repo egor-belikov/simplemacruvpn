@@ -37,7 +37,9 @@ brew tap egor-belikov/simplemacruvpn https://github.com/egor-belikov/simplemacru
 brew install simplemacruvpn
 ```
 
-Формула в этом же репозитории (`Formula/simplemacruvpn.rb`). Для установки нужен Git-тег вида **`v1.3.8`**, совпадающий с версией из формулы (`version "1.3.8"`).
+Если `brew install` жалуется, что файл **`/usr/local/bin/vpn`** уже есть (старый ручной симлинк), удалите его или переустановите ссылку: **`brew unlink simplemacruvpn`** / **`brew link --overwrite simplemacruvpn`**.
+
+У стабильной установке в формуле зафиксированы Git-тег **`v1.3.8`** и **`revision`** (хеш коммита этого тега).
 
 Подробнее: `vpn help` после установки.
 
