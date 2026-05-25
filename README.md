@@ -35,9 +35,18 @@ vpn help
 - [mihomo](https://formulae.brew.sh/formula/mihomo) (`brew install mihomo`), конфиг в `MIHOMO_DIR` (по умолчанию `/usr/local/etc/mihomo`).
 - `/usr/bin/python3` или задайте `VPN_PY`.
 
-## GitHub и Homebrew
+## Репозиторий
 
-Репозиторий: **simplemacruvpn**. Дальше — отдельный Homebrew tap / formula.
+- <https://github.com/egor-belikov/simplemacruvpn>
+
+```bash
+git clone https://github.com/egor-belikov/simplemacruvpn.git
+cd simplemacruvpn
+```
+
+## Homebrew
+
+Позже — отдельный tap / formula.
 
 ## Лицензия
 
