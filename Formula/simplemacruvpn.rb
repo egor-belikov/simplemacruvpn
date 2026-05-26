@@ -5,8 +5,8 @@ class Simplemacruvpn < Formula
   homepage "https://github.com/egor-belikov/simplemacruvpn"
 
   url "https://github.com/egor-belikov/simplemacruvpn.git",
-      tag:      "v1.3.8",
-      revision: "28376e928ac7ebb5d35b6fe3322781dbcb884f68",
+      tag:      "v1.3.9",
+      revision: "4ed699836f986f951c6d7c957c13aba684236a1d",
       using:    :git
 
   license "MIT"
