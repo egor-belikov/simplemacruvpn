@@ -27,6 +27,7 @@ OPENCC_JSON_URL="${OPENCC_JSON_URL:-https://iplist.opencck.org/?format=json}"
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/vpn"
 ENABLED_AT_FILE="$STATE_DIR/enabled_at"
+AUTORECONNECT_FLAG_FILE="$STATE_DIR/autoreconnect_enabled"
 VPN_SUBSCRIPTIONS_FILE="${VPN_SUBSCRIPTIONS_FILE:-$STATE_DIR/subscriptions.txt}"
 # Реальный путь к файлу (после symlinks через Homebrew всё попадает в .../simplemacruvpn/vpn_dist/bin/vpn)
 _SCRIPT_PATH="$(perl -MCwd -e 'print(Cwd::abs_path(shift)||"")' "${BASH_SOURCE[0]:-$0}")"
@@ -167,6 +168,138 @@ geo_via_proxy() {
   done
   echo "запрос_не_удался"
   return 1
+}
+
+autoreconnect_wanted() {
+  [[ -f "$AUTORECONNECT_FLAG_FILE" ]] && return 0
+  case "${VPN_AUTORECONNECT:-}" in
+    1|yes|YES|true|TRUE) return 0 ;;
+  esac
+  return 1
+}
+
+proxy_health_ok() {
+  local g
+  g="$(geo_via_proxy 2>/dev/null)" || true
+  [[ -z "$g" ]] && return 1
+  [[ "$g" == нет_* ]] && return 1
+  [[ "$g" == запрос_* ]] && return 1
+  return 0
+}
+
+cmd_autoreconnect_run() {
+  local max sleep_s attempt idx name
+  max="${VPN_AUTORECONNECT_MAX_ATTEMPTS:-48}"
+  sleep_s="${VPN_AUTORECONNECT_SLEEP:-3}"
+  if proxy_health_ok; then
+    echo "[autoreconnect] проверка выхода через SOCKS: уже ок, перебор не нужен"
+    return 0
+  fi
+  echo "[autoreconnect] внешняя проверка не проходит — перезапуск mihomo и смена узла по кругу (до ${max} шагов)"
+  echo "[autoreconnect] выключить опцию: vpn autoreconnect off"
+  for ((attempt = 1; attempt <= max; attempt++)); do
+    echo "[autoreconnect] шаг ${attempt}/${max}: brew services restart mihomo …"
+    if [[ -x "$BREW" ]]; then
+      "$BREW" services restart mihomo >/dev/null 2>&1 || "$BREW" services start mihomo >/dev/null 2>&1 || true
+    fi
+    sleep 1
+    if ! wait_socks_listening; then
+      sleep 2
+      wait_socks_listening || true
+    fi
+    idx=$((attempt - 1))
+    name="$(
+      MIHOMO_API="$MIHOMO_API" IDX="$idx" "$VPN_PY" <<'PY'
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+base = os.environ["MIHOMO_API"].rstrip("/")
+try:
+    idx = int(os.environ.get("IDX", "0"))
+except ValueError:
+    idx = 0
+try:
+    with urllib.request.urlopen(f"{base}/proxies/PROXY", timeout=15) as r:
+        meta = json.load(r)
+except urllib.error.URLError as e:
+    sys.stderr.write(f"[autoreconnect] API GET PROXY: {e}\n")
+    sys.exit(0)
+alln = meta.get("all") or []
+leaves = [x for x in alln if x != "FAST-AUTO"]
+order = []
+if "FAST-AUTO" in alln:
+    order.append("FAST-AUTO")
+order.extend(leaves)
+if not order:
+    sys.exit(0)
+sel = order[idx % len(order)]
+try:
+    body = json.dumps({"name": sel}).encode()
+    req = urllib.request.Request(
+        f"{base}/proxies/PROXY",
+        data=body,
+        method="PUT",
+        headers={"Content-Type": "application/json"},
+    )
+    urllib.request.urlopen(req, timeout=15)
+except urllib.error.URLError as e:
+    sys.stderr.write(f"[autoreconnect] API PUT PROXY: {e}\n")
+    sys.exit(0)
+print(sel)
+PY
+    )" || name=""
+    [[ -n "$name" ]] && echo "[autoreconnect] выбран узел PROXY → $name"
+    sleep "$sleep_s"
+    if proxy_health_ok; then
+      echo "[autoreconnect] готово: внешняя проверка через SOCKS успешна (шаг ${attempt})"
+      return 0
+    fi
+  done
+  echo "[autoreconnect] не удалось за ${max} шагов — смотри vpn info, vpn bench, vpn proxy …" >&2
+  return 1
+}
+
+cmd_autoreconnect() {
+  mkdir -p "$STATE_DIR"
+  local sub="${1:-status}"
+  case "$sub" in
+    '' | status | s)
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo " автопереподключение при «vpn on»"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      if autoreconnect_wanted; then
+        echo " Состояние: ВКЛ"
+        [[ -f "$AUTORECONNECT_FLAG_FILE" ]] && echo " Файл-флаг: $AUTORECONNECT_FLAG_FILE"
+        case "${VPN_AUTORECONNECT:-}" in 1 | yes | YES | true | TRUE)
+          echo " Дополнительно одноразово: VPN_AUTORECONNECT=$VPN_AUTORECONNECT"
+          ;;
+        esac
+      else
+        echo " Состояние: выкл  →  включить: vpn autoreconnect on"
+      fi
+      echo ""
+      echo " Пока HTTPS через SOCKS к ipinfo/ifconfig/ip.sb не отвечает: restart mihomo и перебор"
+      echo " узлов группы PROXY по кругу (FAST-AUTO, затем остальные в порядке списка)."
+      echo " Лимит шагов: VPN_AUTORECONNECT_MAX_ATTEMPTS (сейчас по умолч. 48)."
+      echo " Пауза между шагами: VPN_AUTORECONNECT_SLEEP (по умолч. 3 с)."
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      ;;
+    on | 1 | yes | YES | true | TRUE)
+      printf '1\n' >"$AUTORECONNECT_FLAG_FILE"
+      echo "[autoreconnect] ВКЛ · флаг: $AUTORECONNECT_FLAG_FILE"
+      ;;
+    off | 0 | no | NO | false | FALSE)
+      rm -f "$AUTORECONNECT_FLAG_FILE"
+      echo "[autoreconnect] выкл"
+      ;;
+    *)
+      echo "usage: vpn autoreconnect [on|off|status]" >&2
+      exit 1
+      ;;
+  esac
 }
 
 mihomo_fast_auto_now() {
@@ -313,6 +446,10 @@ cmd_on() {
   mpid="$(mihomo_pid || true)"
   [[ -n "$mpid" ]] && echo "[on] mihomo PID: $mpid · слушает $SOCKS_PORT: да"
 
+  if autoreconnect_wanted; then
+    cmd_autoreconnect_run || true
+  fi
+
   geo="$(geo_via_proxy 2>/dev/null || echo …)"
   IFS='|' read -r _g_cc _g_city _g_ip <<<"${geo}|"
   if [[ -n "${_g_cc:-}" && "$_g_cc" != … && "$_g_cc" != нет_* && "$_g_cc" != запрос_* ]]; then
@@ -400,11 +537,18 @@ cmd_status() {
     echo " процесс не найден (pgrep)"
   fi
 
+  echo "--- автопереподключение (после включения SOCKS)"
+  if autoreconnect_wanted; then
+    echo " vpn autoreconnect: ВКЛ (vpn autoreconnect off — выключить)"
+  else
+    echo " vpn autoreconnect: выкл (vpn autoreconnect on — вкл.; при «vpn on» ищет живой узел)"
+  fi
+
   echo "--- подсказки"
   echo " vpn info  — страна через прокси, аптайм, длительность сессии"
   echo " vpn help  — все команды"
   echo " vpn bench · vpn proxy … · vpn countries · vpn subs preview · vpn hw"
-  echo " vpn autostart-diag · vpn autostart-fix"
+  echo " vpn autostart-diag · vpn autostart-fix · vpn autoreconnect"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
   if socks_enabled && ! socks_listening; then
@@ -742,11 +886,18 @@ cmd_help() {
   vpn autostart-diag | ad
   vpn autostart-fix | af
 
+ АВТОПЕРЕПОДКЛЮЧЕНИЕ (проверка выхода через SOCKS при «vpn on»)
+  vpn autoreconnect | ar           статус опции и краткая справка
+  vpn autoreconnect on | off       записать флаг в ~/.local/state/vpn/autoreconnect_enabled
+
  ПЕРЕМЕННЫЕ (необязательно)
   VPN_SERVICE            интерфейс для networksetup (по умолчанию Wi‑Fi)
   MIHOMO_DIR             каталог конфига mihomo
   VPN_SUBSCRIPTIONS_FILE путь к файлу URL подписок
   VPN_SUBS_CMD           скрипт python для vpn subs
+  VPN_AUTORECONNECT      1 / yes / true — одноразово как «autoreconnect on» (без файла-флага)
+  VPN_AUTORECONNECT_MAX_ATTEMPTS  лимит шагов перебора (по умолч. 48)
+  VPN_AUTORECONNECT_SLEEP         пауза между шагами (сек., по умолч. 3)
 
  Примечание: публикация в Homebrew — отдельный шаг позже (нужен свой tap/формула).
 
@@ -770,6 +921,10 @@ case "${1:-}" in
   info|i) cmd_info ;;
   autostart-diag|ad) cmd_autostart_diag ;;
   autostart-fix|af) cmd_autostart_fix ;;
+  autoreconnect|ar)
+    shift
+    cmd_autoreconnect "${1:-status}"
+    ;;
   t|toggle)
     if socks_enabled; then cmd_off; else cmd_on; fi
     ;;

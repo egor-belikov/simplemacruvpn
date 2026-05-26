@@ -30,6 +30,15 @@ sudo ln -sf "$PWD/bin/vpn" /usr/local/bin/vpn   # или другой катал
 vpn help
 ```
 
+### Автопереподключение при `vpn on`
+
+Пока HTTPS через SOCKS до сервисов гео-проверки (ipinfo и т.п.) не проходит, скрипт может **перезапускать mihomo и крутить узлы группы PROXY** (FAST-AUTO, затем остальные из списка), пока проверка не удастся или не исчерпается лимит шагов.
+
+- Включить/выключить (флаг в `~/.local/state/vpn/autoreconnect_enabled`): `vpn autoreconnect on` · `vpn autoreconnect off`
+- Статус и справка: `vpn autoreconnect`
+- Одноразово без файла: переменная **`VPN_AUTORECONNECT=1`** (или `yes` / `true`)
+- Лимиты: **`VPN_AUTORECONNECT_MAX_ATTEMPTS`** (по умолчанию 48), **`VPN_AUTORECONNECT_SLEEP`** (сек. между шагами, по умолчанию 3)
+
 ## Homebrew
 
 ```bash
